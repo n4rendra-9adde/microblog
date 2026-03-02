@@ -28,12 +28,12 @@ pipeline {
             steps {
                 sh '''
                     echo "=== Gitleaks Secret Scan ==="
-                    gitleaks detect --source . --report-format json --report-path ${REPORT_DIR}/gitleaks-report.json || true
+                    gitleaks detect --source . --report-format json --report-path ${REPORT_DIR}/gitleaks-report.json
                 '''
             }
             post {
                 always {
-                    archiveArtifacts artifacts: "${REPORT_DIR}/gitleaks-report.json", allowEmptyArchive: true
+                    archiveArtifacts artifacts: "${REPORT_DIR}/gitleaks-report.json"
                 }
             }
         }
@@ -98,7 +98,7 @@ pipeline {
             steps {
                 sh '''
                     . venv/bin/activate
-                    pytest --junitxml=${REPORT_DIR}/junit.xml --cov=. --cov-report=html:${REPORT_DIR}/coverage || true
+                    pytest --junitxml=${REPORT_DIR}/junit.xml --cov=. --cov-report=html:${REPORT_DIR}/coverage
                 '''
             }
             post {
@@ -107,7 +107,6 @@ pipeline {
                     publishHTML(target: [
                         allowMissing: true,
                         alwaysLinkToLastBuild: true,
-                        allowEmptyResults: true,
                         reportDir: "${REPORT_DIR}/coverage",
                         reportFiles: 'index.html',
                         reportName: 'Coverage Report'
@@ -124,7 +123,7 @@ pipeline {
                         docker build -t python-app:${IMAGE_TAG} .
                         
                         echo "=== Trivy Image Scan ==="
-                        trivy image --format json --output ${REPORT_DIR}/trivy-report.json --severity HIGH,CRITICAL python-app:${IMAGE_TAG} || true
+                        trivy image --format json --output ${REPORT_DIR}/trivy-report.json --severity HIGH,CRITICAL python-app:${IMAGE_TAG} 
                     '''
                 }
             }
