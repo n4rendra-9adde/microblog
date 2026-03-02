@@ -1,15 +1,18 @@
-FROM python:slim
+FROM python:3.12-slim
 
-# Install PostgreSQL dev libraries
+WORKDIR /app
+
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     libpq-dev \
     gcc \
-    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Then install Python packages
-COPY requirements.txt requirements.txt
+COPY requirements.txt .
 RUN pip install -r requirements.txt
+
+COPY . .
+CMD ["python", "app.py"]
 
 RUN pip install gunicorn pymysql cryptography
 
