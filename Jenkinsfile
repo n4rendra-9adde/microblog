@@ -107,7 +107,7 @@ pipeline {
                     publishHTML(target: [
                         allowMissing: true,
                         alwaysLinkToLastBuild: true,
-                        allowEmptyResults: true
+                        allowEmptyResults: true,
                         reportDir: "${REPORT_DIR}/coverage",
                         reportFiles: 'index.html',
                         reportName: 'Coverage Report'
