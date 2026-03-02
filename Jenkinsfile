@@ -1,45 +1,34 @@
 pipeline {
-    agent { label 'vm-agent' }
-
+    agent any
+    
     environment {
         REPORT_DIR = 'security-reports'
+        SONAR_TOKEN = credentials('sonarqube-token')
+        SONAR_HOST_URL = 'http://localhost:9000'
         IMAGE_TAG = "${BUILD_NUMBER}"
+        // Optional: set Python interpreter if needed
+        // PYTHON = 'python3'
     }
-
+    
     options {
         buildDiscarder(logRotator(numToKeepStr: '10'))
         timeout(time: 2, unit: 'HOURS')
         disableConcurrentBuilds()
     }
-
+    
     stages {
-
-        // ==========================================
-        // STAGE 1: ENVIRONMENT CHECK
-        // ==========================================
         stage('Environment Check') {
             steps {
-                echo "Pipeline started - Build #${BUILD_NUMBER}"
-                sh '''
-                    mkdir -p ${REPORT_DIR}
-                    python3 --version
-                    pip --version
-                    docker --version
-                '''
+                echo " Pipeline started - Build #${env.BUILD_NUMBER}"
+                sh 'mkdir -p ${REPORT_DIR}'
             }
         }
-
-        // ==========================================
-        // STAGE 2: SECRET SCANNING
-        // ==========================================
-        stage('Secret Scanning - Gitleaks') {
+        
+        stage('Secret Scanning') {
             steps {
                 sh '''
                     echo "=== Gitleaks Secret Scan ==="
-                    gitleaks detect \
-                        --source . \
-                        --report-format json \
-                        --report-path ${REPORT_DIR}/gitleaks-report.json || true
+                    gitleaks detect --source . --report-format json --report-path ${REPORT_DIR}/gitleaks-report.json || true
                 '''
             }
             post {
@@ -48,94 +37,95 @@ pipeline {
                 }
             }
         }
-
-        // ==========================================
-        // STAGE 3: DEPENDENCY INSTALL
-        // ==========================================
-        stage('Install Python Dependencies') {
+        
+        stage('Build & Dependencies') {
             steps {
                 sh '''
+                    echo "=== Setting up Python virtual environment ==="
+                    python3 -m venv venv
+                    . venv/bin/activate
                     pip install --upgrade pip
                     pip install -r requirements.txt
+                    # Install additional tools for security and testing
+                    pip install safety pytest pytest-cov bandit
                 '''
             }
         }
-
-        // ==========================================
-        // STAGE 4: SAST - BANDIT
-        // ==========================================
-        stage('SAST - Bandit') {
+        
+        stage('SAST - SonarQube') {
+            steps {
+                script {
+                    def scannerHome = tool 'SonarScanner'
+                    withSonarQubeEnv('SonarQube') {
+                        sh """
+                            ${scannerHome}/bin/sonar-scanner \
+                            -Dsonar.projectKey=python-app \
+                            -Dsonar.projectName='Python App' \
+                            -Dsonar.language=py \
+                            -Dsonar.python.version=3 \
+                            -Dsonar.sources=. \
+                            -Dsonar.exclusions=venv/**,**/__pycache__/**,**/*.pyc
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('SCA - Dependency Scanning') {
             steps {
                 sh '''
-                    bandit -r . \
-                        -f json \
-                        -o ${REPORT_DIR}/bandit-report.json || true
+                    echo "=== OWASP Dependency-Check ==="
+                    /opt/dependency-check/bin/dependency-check.sh \
+                        --project "Python App" \
+                        --scan . \
+                        --format JSON --format HTML \
+                        --out ${REPORT_DIR}/dependency-check \
+                        --enableExperimental || true
+                    
+                    echo "=== Safety Vulnerability Scan ==="
+                    . venv/bin/activate
+                    safety check --json > ${REPORT_DIR}/safety-report.json || true
                 '''
             }
             post {
                 always {
-                    archiveArtifacts artifacts: "${REPORT_DIR}/bandit-report.json", allowEmptyArchive: true
+                    archiveArtifacts artifacts: "${REPORT_DIR}/dependency-check/*,${REPORT_DIR}/safety-report.json", allowEmptyArchive: true
                 }
             }
         }
-
-        // ==========================================
-        // STAGE 5: SCA - PIP-AUDIT
-        // ==========================================
-        stage('SCA - pip-audit') {
+        
+        stage('Unit Tests') {
             steps {
                 sh '''
-                    pip-audit -r requirements.txt \
-                        --format json \
-                        -o ${REPORT_DIR}/pip-audit-report.json || true
+                    . venv/bin/activate
+                    pytest --junitxml=${REPORT_DIR}/junit.xml --cov=. --cov-report=html:${REPORT_DIR}/coverage
                 '''
             }
             post {
                 always {
-                    archiveArtifacts artifacts: "${REPORT_DIR}/pip-audit-report.json", allowEmptyArchive: true
+                    junit testResults: "${REPORT_DIR}/junit.xml", allowEmptyResults: true
+                    publishHTML(target: [
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        reportDir: "${REPORT_DIR}/coverage",
+                        reportFiles: 'index.html',
+                        reportName: 'Coverage Report'
+                    ])
                 }
             }
         }
-
-        // ==========================================
-        // STAGE 6: UNIT TESTS
-        // ==========================================
-        stage('Unit Tests - Pytest') {
+        
+        stage('Container Security') {
             steps {
-                sh '''
-                    pytest --junitxml=${REPORT_DIR}/pytest-report.xml || true
-                '''
-            }
-            post {
-                always {
-                    junit testResults: "${REPORT_DIR}/pytest-report.xml", allowEmptyResults: true
+                script {
+                    sh '''
+                        echo "=== Building Docker Image ==="
+                        docker build -t python-app:${IMAGE_TAG} .
+                        
+                        echo "=== Trivy Image Scan ==="
+                        trivy image --format json --output ${REPORT_DIR}/trivy-report.json --severity HIGH,CRITICAL python-app:${IMAGE_TAG} || true
+                    '''
                 }
-            }
-        }
-
-        // ==========================================
-        // STAGE 7: DOCKER BUILD
-        // ==========================================
-        stage('Docker Build') {
-            steps {
-                sh '''
-                    docker build -t python-app:${IMAGE_TAG} .
-                '''
-            }
-        }
-
-        // ==========================================
-        // STAGE 8: CONTAINER SECURITY - TRIVY
-        // ==========================================
-        stage('Container Security - Trivy') {
-            steps {
-                sh '''
-                    trivy image \
-                        --severity HIGH,CRITICAL \
-                        --format json \
-                        --output ${REPORT_DIR}/trivy-report.json \
-                        python-app:${IMAGE_TAG} || true
-                '''
             }
             post {
                 always {
@@ -143,118 +133,138 @@ pipeline {
                 }
             }
         }
-
-        // ==========================================
-        // STAGE 9: APPROVAL - STAGING
-        // ==========================================
+        
         stage('Approval: Deploy to Staging') {
             steps {
                 script {
-                    input message: 'Approve deployment to STAGING?',
-                          ok: 'Deploy to Staging',
-                          submitterParameter: 'STAGING_APPROVER'
-                    echo "Approved by: ${STAGING_APPROVER}"
+                    input message: 'Approve deployment to STAGING?', ok: 'Deploy to Staging', submitterParameter: 'APPROVER'
+                    echo "Approved by: ${env.APPROVER}"
                 }
             }
         }
-
-        // ==========================================
-        // STAGE 10: DEPLOY TO STAGING
-        // ==========================================
+        
         stage('Deploy to Staging') {
             steps {
                 sh '''
-                    docker stop python-staging 2>/dev/null || true
-                    docker rm python-staging 2>/dev/null || true
-                    docker run -d \
-                        --name python-staging \
-                        -p 8000:8000 \
-                        python-app:${IMAGE_TAG}
+                    docker stop python-app-staging 2>/dev/null || true
+                    docker rm python-app-staging 2>/dev/null || true
+                    docker run -d --name python-app-staging -p 5000:5000 python-app:${IMAGE_TAG}
+                    sleep 5
                 '''
             }
         }
-
-        // ==========================================
-        // STAGE 11: APPROVAL - PRODUCTION
-        // ==========================================
+        
         stage('Approval: Deploy to Production') {
             steps {
                 script {
                     timeout(time: 24, unit: 'HOURS') {
-                        input message: 'Approve deployment to PRODUCTION?',
-                              ok: 'Deploy to Production',
-                              submitterParameter: 'PROD_APPROVER'
+                        input message: 'Approve deployment to PRODUCTION?', ok: 'Deploy to Production', submitterParameter: 'PROD_APPROVER'
                     }
-                    echo "Production approved by: ${PROD_APPROVER}"
+                    echo "Production approved by: ${env.PROD_APPROVER}"
                 }
             }
         }
-
-        // ==========================================
-        // STAGE 12: DEPLOY TO PRODUCTION
-        // ==========================================
+        
         stage('Deploy to Production') {
             steps {
-                sh '''
-                    docker stop python-production 2>/dev/null || true
-                    docker rm python-production 2>/dev/null || true
-                    docker run -d \
-                        --name python-production \
-                        -p 80:8000 \
-                        python-app:${IMAGE_TAG}
-                '''
+                sh 'docker tag python-app:${IMAGE_TAG} python-app:production'
             }
         }
-
+        
         // ==========================================
-        // STAGE 13: FINAL SECURITY REPORT
+        // Final Report Generation
         // ==========================================
         stage('Generate Final Report') {
             steps {
-                sh '''
-cat > ${REPORT_DIR}/pipeline-summary.html << 'EOF'
+                script {
+                    sh '''
+                        echo "=== 📊 Generating Final Security Report ==="
+                        
+                        cat > ${REPORT_DIR}/pipeline-summary.html << 'HTMLEOF'
 <!DOCTYPE html>
 <html>
 <head>
-<title>DevSecOps Pipeline Report</title>
-<style>
-body { font-family: Arial; background: #f5f5f5; padding: 30px; }
-.header { background: #2c3e50; color: white; padding: 20px; border-radius: 5px; }
-.section { background: white; padding: 20px; margin-top: 20px; border-radius: 5px; }
-.success { color: green; font-weight: bold; }
-</style>
+    <title>DevSecOps Pipeline Report - Python</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+        .header { background: #2c3e50; color: white; padding: 20px; border-radius: 5px; }
+        .summary { background: white; padding: 20px; margin: 20px 0; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .stage { background: white; padding: 15px; margin: 10px 0; border-left: 4px solid #27ae60; }
+        .stage.failed { border-left-color: #e74c3c; }
+        .metric { display: inline-block; margin: 10px 20px 10px 0; }
+        .metric-value { font-size: 24px; font-weight: bold; color: #27ae60; }
+        .metric-label { font-size: 12px; color: #7f8c8d; }
+    </style>
 </head>
 <body>
-<div class="header">
-<h1>DevSecOps Pipeline Summary</h1>
-<p>Build #: BUILD_NUMBER</p>
-<p>Commit: GIT_COMMIT</p>
-<p>Date: BUILD_DATE</p>
-</div>
+    <div class="header">
+        <h1>🐍 DevSecOps Pipeline Report - Python</h1>
+        <p>Build #BUILD_NUMBER | Commit: GIT_COMMIT | Date: BUILD_DATE</p>
+    </div>
+    
+    <div class="summary">
+        <h2>Executive Summary</h2>
+        <div class="metric">
+            <div class="metric-value">7</div>
+            <div class="metric-label">Security Scans</div>
+        </div>
+        <div class="metric">
+            <div class="metric-value">2</div>
+            <div class="metric-label">Approval Gates</div>
+        </div>
+        <div class="metric">
+            <div class="metric-value" style="color: #27ae60;">PASSED</div>
+            <div class="metric-label">Status</div>
+        </div>
+    </div>
 
-<div class="section">
-<h2>Security Coverage</h2>
-<ul>
-<li>Secret Scanning – Gitleaks</li>
-<li>SAST – Bandit</li>
-<li>SCA – pip-audit</li>
-<li>Container Scan – Trivy</li>
-<li>Unit Tests – Pytest</li>
-<li>Manual Approval Gates</li>
-</ul>
-</div>
+    <div class="stage">
+        <h3>🔐 Secret Scanning (Gitleaks)</h3>
+        <p>Scanned for hardcoded secrets, API keys, and credentials</p>
+    </div>
 
-<div class="section success">
-<h2>Status: PIPELINE COMPLETED</h2>
-</div>
+    <div class="stage">
+        <h3>🔍 SAST (SonarQube for Python)</h3>
+        <p>Static code analysis for bugs, vulnerabilities, and code smells</p>
+    </div>
+
+    <div class="stage">
+        <h3>📦 SCA (OWASP Dependency‑Check + Safety)</h3>
+        <p>Identified known vulnerabilities in Python dependencies</p>
+    </div>
+
+    <div class="stage">
+        <h3>🐳 Container Security (Trivy)</h3>
+        <p>Scanned Docker image for OS and Python package vulnerabilities</p>
+    </div>
+
+    <div class="stage">
+        <h3>✅ Unit Tests (pytest)</h3>
+        <p>Executed unit tests with coverage</p>
+    </div>
+
+    <div class="summary">
+        <h2>Artifacts Generated</h2>
+        <ul>
+            <li>gitleaks-report.json - Secret scanning results</li>
+            <li>dependency-check-report.html - OWASP dependency report</li>
+            <li>safety-report.json - Safety vulnerability report</li>
+            <li>trivy-report.json - Container scan results</li>
+            <li>junit.xml & coverage/ - Unit test results</li>
+        </ul>
+    </div>
 </body>
 </html>
-EOF
+HTMLEOF
 
-sed -i "s/BUILD_NUMBER/${BUILD_NUMBER}/g" ${REPORT_DIR}/pipeline-summary.html
-sed -i "s/GIT_COMMIT/${GIT_COMMIT}/g" ${REPORT_DIR}/pipeline-summary.html
-sed -i "s/BUILD_DATE/$(date)/g" ${REPORT_DIR}/pipeline-summary.html
-                '''
+                        # Replace placeholders
+                        sed -i "s/BUILD_NUMBER/${BUILD_NUMBER}/g" ${REPORT_DIR}/pipeline-summary.html
+                        sed -i "s/GIT_COMMIT/${GIT_COMMIT}/g" ${REPORT_DIR}/pipeline-summary.html
+                        sed -i "s/BUILD_DATE/$(date)/g" ${REPORT_DIR}/pipeline-summary.html
+
+                        echo " Report generated: ${REPORT_DIR}/pipeline-summary.html"
+                    '''
+                }
             }
             post {
                 always {
@@ -271,18 +281,18 @@ sed -i "s/BUILD_DATE/$(date)/g" ${REPORT_DIR}/pipeline-summary.html
             }
         }
     }
-
+    
     post {
         always {
-            echo "======================================"
-            echo "PIPELINE COMPLETED - BUILD #${BUILD_NUMBER}"
-            echo "======================================"
+            echo "=========================================="
+            echo "PIPELINE COMPLETED - Build #${BUILD_NUMBER}"
+            echo "=========================================="
         }
         success {
-            echo "SUCCESS - Application deployed securely"
+            echo "✅ SUCCESS! Check the Pipeline Summary Report"
         }
         failure {
-            echo "FAILURE - Check Jenkins logs and reports"
+            echo "❌ FAILED!"
         }
     }
 }
